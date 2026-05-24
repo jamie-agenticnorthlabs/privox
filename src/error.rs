@@ -1,3 +1,8 @@
+// Error variants are part of the public API surface. Many are not yet constructed
+// because the full pipeline is still being wired up; suppress dead_code warnings
+// for this module rather than deleting intentional API entries.
+#![allow(dead_code)]
+
 /// All error types for `privox`, using `thiserror` for automatic `Display` and `From` impls.
 ///
 /// `PrivoxError` is the library-level error type. Application code in `main.rs` and `server.rs`

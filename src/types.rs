@@ -109,6 +109,8 @@ impl EntityType {
         }
     }
 
+    // Will be used by the Presidio detector to filter entity types before querying.
+    #[allow(dead_code)]
     /// Returns `true` if this entity type requires an optional detection backend
     /// (NER or Presidio) and is NOT detected by the always-active regex detector.
     pub fn requires_optional_backend(&self) -> bool {
@@ -299,6 +301,8 @@ pub enum MessageContent {
 }
 
 impl MessageContent {
+    // Will be used by the server to extract text for detection from multi-part messages.
+    #[allow(dead_code)]
     /// Returns all text segments from this content value.
     ///
     /// For `Text`, returns a single-element vec. For `Parts`, collects the `text`

@@ -24,12 +24,15 @@
 use async_trait::async_trait;
 
 use crate::{
+    config::PresidioConfig,
     error::DetectorError,
     types::{DetectedEntity, EntityType},
 };
 
 use super::{Detector, DetectorPriority};
 
+// Will be called by detect() once the HTTP client is implemented.
+#[allow(dead_code)]
 /// Presidio entity type strings mapped to privox [`EntityType`] variants.
 ///
 /// Source: <https://microsoft.github.io/presidio/supported_entities/>
@@ -58,22 +61,7 @@ pub struct PresidioDetector {
 }
 
 impl PresidioDetector {
-    /// Creates a new `PresidioDetector`.
-    ///
-    /// # Arguments
-    ///
-    /// * `analyzer_url` — base URL of the Presidio analyzer service.
-    /// * `language` — language code passed to Presidio (e.g. `"en"`).
-    /// * `score_threshold` — minimum confidence score (0.0–1.0); entities below this are discarded.
-    /// * `fallback_to_regex` — if `true`, return empty results on Presidio errors instead of failing.
-    /// * `timeout_secs` — HTTP request timeout.
-    pub fn new(
-        _analyzer_url: String,
-        _language: String,
-        _score_threshold: f64,
-        _fallback_to_regex: bool,
-        _timeout_secs: u64,
-    ) -> Self {
+    pub fn new(_config: PresidioConfig) -> Self {
         // TODO(next-session): Build reqwest client and store config.
         Self {}
     }
@@ -175,13 +163,13 @@ mod tests {
 
     #[test]
     fn presidio_detector_priority_is_highest() {
-        let d = PresidioDetector::new(
-            "http://localhost:5002".to_string(),
-            "en".to_string(),
-            0.7,
-            true,
-            5,
-        );
+        let d = PresidioDetector::new(crate::config::PresidioConfig {
+            analyzer_url: "http://localhost:5002".to_string(),
+            timeout_secs: 5,
+            language: "en".to_string(),
+            score_threshold: 0.7,
+            fallback_to_regex: true,
+        });
         assert_eq!(
             d.priority(),
             DetectorPriority::Presidio,

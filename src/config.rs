@@ -3,7 +3,7 @@
 ///
 /// Config is loaded from a TOML file (default `~/.privox/config.toml`) and then
 /// overlaid with environment variable overrides using the `PRIVOX_` prefix.
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::error::ConfigError;
 
@@ -275,11 +275,6 @@ impl Config {
         Ok(Self::from_raw(raw))
     }
 
-    /// Returns the resolved path to the default config file (`~/.privox/config.toml`).
-    pub fn default_path() -> PathBuf {
-        dirs_home().join(".privox").join("config.toml")
-    }
-
     fn from_raw(raw: RawConfig) -> Self {
         let defaults = Self::default();
         Self {
@@ -450,14 +445,6 @@ fn apply_env_overrides(cfg: &mut Config, env_getter: impl Fn(&str) -> Option<Str
         cfg.detection.presidio.fallback_to_regex =
             matches!(v.to_lowercase().as_str(), "true" | "1" | "yes");
     }
-}
-
-/// Returns the user's home directory for config/vault default paths.
-fn dirs_home() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[cfg(test)]

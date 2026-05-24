@@ -14,6 +14,7 @@
 ///
 /// This ordering is encoded in the [`DetectorPriority`] enum.
 use async_trait::async_trait;
+use tracing::debug;
 
 use crate::{error::DetectorError, types::DetectedEntity};
 
@@ -95,6 +96,7 @@ impl DetectorPipeline {
         let mut tagged: Vec<(DetectorPriority, DetectedEntity)> = Vec::new();
 
         for (priority, detector) in &self.detectors {
+            debug!(detector = %detector.name(), "running detector");
             match detector.detect(text).await {
                 Ok(entities) => {
                     for entity in entities {

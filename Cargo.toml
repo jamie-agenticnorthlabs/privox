@@ -69,3 +69,8 @@ rand = "0.8"
 # Required until async-in-traits lands in our MSRV (1.75 native async traits are
 # not yet object-safe without additional workarounds).
 async-trait = "0.1"
+
+# Stream adaptors for tokio primitives — provides ReceiverStream (mpsc::Receiver → Stream)
+# and StreamExt::next() for iterating reqwest byte streams. Part of the tokio project.
+# Not in the original approved list; added to support SSE streaming with axum's Sse<S>.
+tokio-stream = { version = "0.1", features = ["sync"] }
