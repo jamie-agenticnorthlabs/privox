@@ -11,11 +11,12 @@ of the relevant sections so the most recent state is always visible first.
 
 ## Current State
 
-**Last updated:** 2026-05-24 — Session 2 (Claude Sonnet 4.6)
+**Last updated:** 2026-05-24 — Session 3 (Claude Sonnet 4.6)
 **Build status:** COMPILES
-**Test status:** 51 passed, 0 failing
+**Test status:** 108 passed, 0 failing
 **Clippy:** CLEAN (`cargo clippy -- -D warnings` passes)
 **Fmt:** CLEAN (`cargo fmt --check` produces no diff)
+**Git:** 5 commits on main, ahead of origin/main by 5 (push pending — user in remote session)
 
 ### What Is Done
 
@@ -40,17 +41,23 @@ of the relevant sections so the most recent state is always visible first.
 - [x] `detector/mod.rs` — `Detector` trait (async-trait), `DetectorPriority` enum,
       `DetectorPipeline`, `merge_spans` deduplication; 7 unit tests passing
 - [x] `detector/presidio.rs` — `PresidioDetector` stub implementing `Detector` trait;
-      Presidio entity type mapping table; 3 unit tests passing
-- [~] `detector/regex.rs` — stub only
-- [~] `detector/ner.rs` — stub only
-- [~] `detokenizer.rs` — stub only
-- [~] `proxy.rs` — stub only
-- [~] `server.rs` — stub only
-- [~] `main.rs` — module declarations only, no business logic
+      Presidio entity type mapping table; `new(PresidioConfig)` signature; 3 unit tests passing
+- [x] `detector/regex.rs` — 11 patterns (OnceLock), Luhn validation, 34 unit tests passing
+- [x] `detector/ner.rs` — Ollama `/api/generate` client, NER prompt, JSON response parsing,
+      graceful degradation on connect/timeout; 12 unit tests passing
+- [x] `detokenizer.rs` — `Detokenizer` (bulk) + `StreamingDetokenizer` (64-byte sliding window);
+      token regex `\b[A-Z_]+_[0-9a-f]{6}\b`; 11 unit tests passing
+- [x] `proxy.rs` — `UpstreamClient` wrapping reqwest, timeout, `UpstreamError` mapping
+- [x] `server.rs` — axum routes `/v1/chat/completions` + `/v1/completions`; four-stage pipeline
+      (detect → tokenize → forward → detokenize); SSE streaming via mpsc channel +
+      `ReceiverStream` + `StreamingDetokenizer`; synthetic delta events for buffered content
+- [x] `main.rs` — clap CLI: `init`, `check`, `vault purge/stats/clear` subcommands;
+      secret file management (0600 perms on Unix); tokio runtime bootstrap; JSON tracing
+- [x] `README.md` — architecture diagram, quickstart, config reference, entity type table,
+      security model; committed but push pending
 - [ ] Integration tests — non-streaming
 - [ ] Integration tests — streaming
-- [ ] CLI subcommands (vault purge, vault stats, vault clear, check)
-- [ ] README.md
+- [ ] `detector/presidio.rs` — full HTTP client implementation (currently stub `Ok(vec![])`)
 - [ ] CONTRIBUTING.md
 - [ ] SECURITY.md
 - [ ] CHANGELOG.md
@@ -60,62 +67,19 @@ of the relevant sections so the most recent state is always visible first.
 
 ## Active Task
 
-Implement the next layer of modules in dependency order. The detector and vault layers
-are now complete; the remaining work is the detection logic and the HTTP pipeline.
+No active task. Session 3 completed all core HTTP pipeline modules. Push pending.
 
-### Next up: `detector/regex.rs`
-
-Implement all regex-based entity detectors from REQUIREMENTS.md §5.2.
-The `RegexDetector` must implement the `Detector` trait from `detector/mod.rs`.
-
-For each entity type, document the standard or rationale and write at least one
-positive and one negative test case:
-
-1. `EMAIL` — RFC 5321 simplified; use `[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`
-2. `PHONE_CA` / `PHONE_US` — covers `(NXX) NXX-XXXX`, `NXX-NXX-XXXX`, `+1NXXXXXXXXX`,
-   and variations. NXX means first digit 2–9.
-3. `CREDIT_CARD` — 13–19 digits, spaces/hyphens allowed, Luhn-valid.
-   Implement Luhn validation in Rust (not just regex).
-4. `SIN` — 9 digits, optional spaces/hyphens: `\d{3}[ -]?\d{3}[ -]?\d{3}`
-5. `SSN` — `\d{3}-\d{2}-\d{4}` or with spaces
-6. `IBAN` — `[A-Z]{2}\d{2}[A-Z0-9]{11,30}` structural pattern; use structural regex only
-   (Luhn-like checksum verification is out of scope for v1 unless simple)
-7. `IPV4` — `\b((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)\b`
-8. `IPV6` — simplified; match `[:0-9a-fA-F]{2,39}` with at least two colons
-9. `API_KEY` — patterns for `sk-[a-zA-Z0-9]+`, `ghp_[a-zA-Z0-9]+`,
-   `xoxb-[a-zA-Z0-9-]+`, `AIza[a-zA-Z0-9_-]+`, `Bearer [a-zA-Z0-9._-]+`
-10. `URL_WITH_CREDENTIALS` — `https?://[^:@\s]+:[^@\s]+@[^\s]+`
-11. `UUID` — standard UUID v4 format
-
-All patterns should be pre-compiled in a `lazy_static!` or `OnceLock<Regex>`.
-`RegexDetector` is synchronous (since regex is instant) but wraps the `async fn detect`
-interface required by the `Detector` trait.
-
-### Then: `detector/ner.rs`
-
-Implement `NerDetector` as a reqwest client calling Ollama's `/api/generate` endpoint
-with a structured NER prompt. Map named entity tags in the response to `DetectedEntity`.
-Must degrade gracefully when Ollama is unavailable.
-
-### Then: `detokenizer.rs`
-
-Implement response scanning and token substitution:
-1. Regex to find tokens matching `[A-Z_]+_[0-9a-f]{6}` in response text.
-2. For each token found, look up in vault, substitute original value.
-3. If no vault entry, leave token unchanged and log a warning (with token ID only,
-   never the value since we don't have it).
-4. Streaming variant: use a 64-byte sliding window buffer to handle tokens
-   split across SSE chunk boundaries.
-
-### Then: `proxy.rs` and `server.rs`
-
-These wire together the full pipeline: parse → detect → tokenize → forward → detokenize.
+**Next session should start with:**
+1. Push all pending commits to GitHub (user runs `git push origin main` when home)
+2. Write integration tests (`tests/integration/proxy_test.rs`, `tests/integration/streaming_test.rs`)
+3. Implement `detector/presidio.rs` HTTP client (see TODO comments in file)
+4. GitHub Actions CI workflow
 
 ---
 
 ## Failing Tests
 
-None — 51 tests passing.
+None — 108 tests passing.
 
 ---
 
@@ -214,6 +178,18 @@ From `REQUIREMENTS.md` section 12:
 ---
 
 ## Session Log
+
+### Session 3 — 2026-05-24
+Agent: Claude Sonnet 4.6
+Completed: `detector/regex.rs` (11 patterns, Luhn, 34 tests), `detector/ner.rs` (Ollama
+client, NER prompt, JSON parsing, graceful degradation, 12 tests), `detokenizer.rs`
+(bulk + 64-byte streaming sliding window, 11 tests), `proxy.rs` (UpstreamClient),
+`server.rs` (axum routes, four-stage pipeline, SSE streaming via mpsc+ReceiverStream),
+`main.rs` (full CLI wired up). Fixed 17 clippy errors during wiring. Added tokio-stream
+dep for ReceiverStream. README.md committed. All commits pending push to GitHub (user
+in remote session without interactive git auth).
+Build state at stop: COMPILES, 108 tests passing, clippy clean, fmt clean.
+Next: push to GitHub, integration tests, presidio HTTP client impl, CI workflow.
 
 ### Session 2 — 2026-05-24
 Agent: Claude Sonnet 4.6
