@@ -1,0 +1,71 @@
+[package]
+name = "privox"
+version = "0.1.0"
+edition = "2021"
+description = "Privacy proxy for LLM calls — transparent PII tokenization for OpenAI-compatible inference endpoints"
+license = "MIT"
+repository = "https://github.com/YOUR_ORG/privox"
+keywords = ["llm", "privacy", "pii", "proxy", "openai"]
+categories = ["network-programming", "cryptography"]
+rust-version = "1.75"
+
+[dependencies]
+# Async runtime — all features needed for server, timers, file I/O
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server framework — built on tokio, well-maintained, type-safe routing
+axum = { version = "0.8", features = ["macros"] }
+
+# HTTP client for upstream calls — async, TLS support, streaming body
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# JSON serialization for OpenAI protocol and structured log output
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Config file parsing (TOML format)
+toml = "0.8"
+
+# SQLite vault storage — bundled to avoid system lib dependency, WAL mode support
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# AES-256-GCM encryption for vault values at rest
+aes-gcm = "0.10"
+
+# Key derivation (PBKDF2-HMAC-SHA256) for vault encryption key
+pbkdf2 = "0.12"
+
+# HMAC for token short-ID generation (HMAC-SHA256 of original value)
+hmac = "0.12"
+
+# SHA-256 digest used by both PBKDF2 and HMAC
+sha2 = "0.10"
+
+# Regex-based entity detection (EMAIL, PHONE, SSN, etc.)
+regex = "1"
+
+# Request IDs and session IDs (UUID v4)
+uuid = { version = "1", features = ["v4"] }
+
+# Structured logging — tracing instrumentation macros
+tracing = "0.1"
+
+# Structured logging — JSON subscriber, env-filter for level config
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Library error types with automatic Display/From implementations
+thiserror = "2"
+
+# Application-level error propagation with context chaining
+anyhow = "1"
+
+# CLI argument parsing with derive macros
+clap = { version = "4", features = ["derive", "env"] }
+
+# Secure random number generation for installation secret and AES nonces
+rand = "0.8"
+
+# Enables async fn in traits to be object-safe (Box<dyn Detector>).
+# Required until async-in-traits lands in our MSRV (1.75 native async traits are
+# not yet object-safe without additional workarounds).
+async-trait = "0.1"

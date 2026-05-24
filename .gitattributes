@@ -1,0 +1,10 @@
+# Force LF line endings in the repository for all text files.
+# Working copies on Windows will still use CRLF locally if autocrlf=true,
+# but the stored objects always use LF.
+* text=auto eol=lf
+
+# Binaries — no line-ending conversion
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary

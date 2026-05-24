@@ -1,0 +1,23 @@
+# privox rustfmt configuration
+# Only stable rustfmt options are used here (nightly-only options silently ignored on stable).
+# See: https://rust-lang.github.io/rustfmt/?version=v1.7.0&search=
+
+# Must match edition in Cargo.toml
+edition = "2021"
+
+# Maximum line width before rustfmt wraps
+max_width = 100
+
+# Use spaces, not tabs
+hard_tabs = false
+tab_spaces = 4
+
+# Unix line endings in all files
+newline_style = "Unix"
+
+# Use rustfmt's small-heuristics mode for compact formatting of short expressions
+use_small_heuristics = "Default"
+
+# Reorder imports and module declarations alphabetically
+reorder_imports = true
+reorder_modules = true

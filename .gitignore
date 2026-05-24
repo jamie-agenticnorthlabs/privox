@@ -1,0 +1,4 @@
+/target
+
+# Claude Code workspace settings (machine-local, not project code)
+.claude/
