@@ -149,6 +149,23 @@ level = "info"   # trace | debug | info | warn | error
 | `DATE_OF_BIRTH` | Dates in personal context | NER / Presidio |
 | `ACCOUNT_NUMBER` | Contextual account references | NER / Presidio |
 
+## How privox compares to Presidio
+
+Microsoft Presidio is a mature, well-tested Python library for PII detection and anonymization. It has stronger NER quality than privox's built-in regex recognizers, supports 50+ entity types out of the box, handles multiple languages, and has years of investment behind it. If you are building a Python application and Presidio fits your stack, it is an excellent choice.
+
+privox is not trying to replace Presidio's detection capability. What it provides that Presidio does not is the infrastructure layer around the detection step:
+
+- A transparent OpenAI-compatible HTTP proxy that requires zero changes to your calling application
+- Correct streaming detokenization across SSE chunk boundaries (the LiteLLM + Presidio callback buffers the full response before processing, which breaks streaming)
+- An encrypted persistent vault for token-to-value mappings that survives across multiple requests in a long-running agent session
+- A single binary with no Python runtime dependency
+
+When you need the best possible NER quality, privox and Presidio work well together. Set `backends = ["regex", "presidio"]` in your config and point `detection.presidio.analyzer_url` at a locally-running Presidio analyzer service. privox uses Presidio only for detection and handles all tokenization, vault storage, and detokenization itself. If the Presidio sidecar goes down, privox falls back to regex-only rather than failing the request.
+
+If you are already on Python and using LiteLLM, the LiteLLM + Presidio callback is the lower-friction path for non-streaming workloads. privox is the better fit for non-Python agents, single-binary deployments, or any workload where streaming detokenization matters.
+
+privox does not claim to detect PII as accurately as Presidio in its default regex-only configuration. Structured PII (emails, phone numbers, credit cards, API keys) is covered reliably by regex. Unstructured PII (names, organizations, addresses) requires the NER or Presidio backend for meaningful coverage.
+
 ## Token format
 
 Tokens are human-readable and preserve semantic context for the model:
