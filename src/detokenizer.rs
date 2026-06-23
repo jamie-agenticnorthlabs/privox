@@ -103,9 +103,10 @@ impl Detokenizer {
 /// Minimum bytes retained in the trailing buffer so that a token split across
 /// an SSE chunk boundary is always fully buffered before processing.
 ///
-/// The longest possible token is ACCOUNT_NUMBER_xxxxxx = 21 chars; 64 bytes
-/// provides a comfortable margin for any prefix the caller might add.
-const WINDOW: usize = 64;
+/// The longest possible token is ACCOUNT_NUMBER_xxxxxx = 21 chars. A wider
+/// window prevents partial token-looking text from being released when providers
+/// split reasoning/content streams into very small chunks.
+const WINDOW: usize = 512;
 
 /// Stateful detokenizer for SSE streaming responses.
 ///

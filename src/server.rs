@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -21,7 +22,7 @@ use crate::{
     error::UpstreamError,
     proxy::UpstreamClient,
     tokenizer::Tokenizer,
-    types::{ChatRequest, EntityType, MessageContent},
+    types::{ChatRequest, EntityType},
 };
 
 // ── Application state ─────────────────────────────────────────────────────────
@@ -55,21 +56,27 @@ pub async fn run(state: Arc<AppState>, listen: &str) -> anyhow::Result<()> {
 
 async fn chat_completions_handler(
     State(state): State<Arc<AppState>>,
-    Json(mut request): Json<ChatRequest>,
+    Json(request): Json<ChatRequest>,
 ) -> Response {
     let request_id = Uuid::new_v4();
     let streaming = request.stream;
 
-    // Stage 2a: Detect and tokenize all message content.
-    let mut all_entity_types: Vec<EntityType> = Vec::new();
-    for msg in &mut request.messages {
-        if let Some(ref mut content) = msg.content {
-            match tokenize_content(content, &state.pipeline, &state.tokenizer, request_id).await {
-                Ok(types) => all_entity_types.extend(types),
-                Err(resp) => return resp,
-            }
+    // Stage 2a: Detect and tokenize all eligible string leaves in the full
+    // request payload. Protocol/control fields are skipped so model IDs, roles,
+    // tool names, schemas, and provider wiring stay intact.
+    let mut body = match serde_json::to_value(&request) {
+        Ok(v) => v,
+        Err(e) => {
+            error!(request_id = %request_id, error = %e, "failed to serialize request");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "serialization error");
         }
-    }
+    };
+    let all_entity_types =
+        match tokenize_json_strings(&mut body, &state.pipeline, &state.tokenizer, request_id).await
+        {
+            Ok(types) => types,
+            Err(resp) => return resp,
+        };
 
     debug!(
         request_id = %request_id,
@@ -78,14 +85,6 @@ async fn chat_completions_handler(
     );
 
     // Stage 3: Forward sanitized request to upstream.
-    let body = match serde_json::to_value(&request) {
-        Ok(v) => v,
-        Err(e) => {
-            error!(request_id = %request_id, error = %e, "failed to serialize request");
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "serialization error");
-        }
-    };
-
     let upstream_resp = match state.upstream.post("/v1/chat/completions", &body).await {
         Ok(r) => r,
         Err(e) => {
@@ -126,27 +125,10 @@ async fn legacy_completions_handler(
 ) -> Response {
     let request_id = Uuid::new_v4();
 
-    if let Some(prompt) = body
-        .get("prompt")
-        .and_then(|p| p.as_str())
-        .map(str::to_string)
+    if let Err(resp) =
+        tokenize_json_strings(&mut body, &state.pipeline, &state.tokenizer, request_id).await
     {
-        let entities = match state.pipeline.detect(&prompt).await {
-            Ok(e) => e,
-            Err(e) => {
-                error!(request_id = %request_id, error = %e, "detection failed");
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "detection error");
-            }
-        };
-        match state.tokenizer.tokenize(&prompt, &entities) {
-            Ok(result) => {
-                body["prompt"] = Value::String(result.sanitized);
-            }
-            Err(e) => {
-                error!(request_id = %request_id, error = %e, "tokenization failed");
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "tokenization error");
-            }
-        }
+        return resp;
     }
 
     let upstream_resp = match state.upstream.post("/v1/completions", &body).await {
@@ -169,54 +151,144 @@ async fn legacy_completions_handler(
 
 // ── Pipeline helpers ──────────────────────────────────────────────────────────
 
-/// Runs detection and tokenization on a single message content, mutating it in place.
-/// Returns the entity types found, or an error Response if any stage failed.
-async fn tokenize_content(
-    content: &mut MessageContent,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum JsonPathSegment {
+    Key(String),
+    Index(usize),
+}
+
+fn is_protocol_key(key: &str) -> bool {
+    matches!(
+        key,
+        "model"
+            | "role"
+            | "name"
+            | "type"
+            | "id"
+            | "tool_call_id"
+            | "object"
+            | "finish_reason"
+            | "system_fingerprint"
+            | "service_tier"
+    )
+}
+
+fn is_schema_path(path: &[JsonPathSegment]) -> bool {
+    path.iter().any(|segment| {
+        matches!(
+            segment,
+            JsonPathSegment::Key(key)
+                if key == "tools"
+                    || key == "tool_choice"
+                    || key == "response_format"
+                    || key == "functions"
+        )
+    })
+}
+
+fn should_tokenize_path(path: &[JsonPathSegment]) -> bool {
+    if is_schema_path(path) {
+        return false;
+    }
+    !matches!(
+        path.last(),
+        Some(JsonPathSegment::Key(key)) if is_protocol_key(key)
+    )
+}
+
+fn collect_string_paths(
+    value: &Value,
+    path: &mut Vec<JsonPathSegment>,
+    out: &mut Vec<Vec<JsonPathSegment>>,
+) {
+    match value {
+        Value::String(_) => {
+            if should_tokenize_path(path) {
+                out.push(path.clone());
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                path.push(JsonPathSegment::Index(index));
+                collect_string_paths(item, path, out);
+                path.pop();
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                path.push(JsonPathSegment::Key(key.clone()));
+                collect_string_paths(item, path, out);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn value_mut_at_path<'a>(value: &'a mut Value, path: &[JsonPathSegment]) -> Option<&'a mut Value> {
+    let mut current = value;
+    for segment in path {
+        match segment {
+            JsonPathSegment::Key(key) => current = current.get_mut(key)?,
+            JsonPathSegment::Index(index) => current = current.get_mut(*index)?,
+        }
+    }
+    Some(current)
+}
+
+async fn tokenize_json_strings(
+    value: &mut Value,
     pipeline: &DetectorPipeline,
     tokenizer: &Tokenizer,
     request_id: Uuid,
 ) -> Result<Vec<EntityType>, Response> {
-    match content {
-        MessageContent::Text(ref mut text) => {
-            let entities = pipeline.detect(text).await.map_err(|e| {
-                error!(request_id = %request_id, error = %e, "detection failed");
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, "detection error")
-            })?;
-            let result = tokenizer.tokenize(text, &entities).map_err(|e| {
-                error!(request_id = %request_id, error = %e, "tokenization failed");
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, "tokenization error")
-            })?;
-            *text = result.sanitized;
-            Ok(result.entity_types_found)
-        }
-        MessageContent::Parts(ref mut parts) => {
-            let mut found = Vec::new();
-            for part in parts.iter_mut() {
-                if part.get("type").and_then(|t| t.as_str()) != Some("text") {
-                    continue;
-                }
-                let Some(text_val) = part.get_mut("text") else {
-                    continue;
-                };
-                let Some(text) = text_val.as_str().map(str::to_string) else {
-                    continue;
-                };
-
-                let entities = pipeline.detect(&text).await.map_err(|e| {
-                    error!(request_id = %request_id, error = %e, "detection failed");
-                    error_response(StatusCode::INTERNAL_SERVER_ERROR, "detection error")
-                })?;
-                let result = tokenizer.tokenize(&text, &entities).map_err(|e| {
-                    error!(request_id = %request_id, error = %e, "tokenization failed");
-                    error_response(StatusCode::INTERNAL_SERVER_ERROR, "tokenization error")
-                })?;
-                found.extend(result.entity_types_found);
-                *text_val = Value::String(result.sanitized);
-            }
-            Ok(found)
+    let mut paths = Vec::new();
+    collect_string_paths(value, &mut Vec::new(), &mut paths);
+    let mut found = Vec::new();
+    for path in paths {
+        let Some(text_val) = value_mut_at_path(value, &path) else {
+            continue;
+        };
+        let Some(text) = text_val.as_str().map(str::to_string) else {
+            continue;
+        };
+        let entities = pipeline.detect(&text).await.map_err(|e| {
+            error!(request_id = %request_id, error = %e, "detection failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "detection error")
+        })?;
+        let result = tokenizer.tokenize(&text, &entities).map_err(|e| {
+            error!(request_id = %request_id, error = %e, "tokenization failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "tokenization error")
+        })?;
+        if !result.entity_types_found.is_empty() {
+            *text_val = Value::String(result.sanitized);
+            found.extend(result.entity_types_found);
         }
     }
+    Ok(found)
+}
+
+fn detokenize_json_strings(value: &mut Value, detokenizer: &Detokenizer) -> Result<(), Response> {
+    match value {
+        Value::String(text) => {
+            *text = detokenizer.detokenize(text).map_err(|e| {
+                error!(error = %e, "detokenization failed");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "detokenization error")
+            })?;
+        }
+        Value::Array(items) => {
+            for item in items {
+                detokenize_json_strings(item, detokenizer)?;
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                detokenize_json_strings(item, detokenizer)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 // ── Response handling ─────────────────────────────────────────────────────────
@@ -229,15 +301,18 @@ async fn handle_non_streaming(resp: reqwest::Response, detokenizer: &Detokenizer
             return error_response(StatusCode::BAD_GATEWAY, "failed to read upstream response");
         }
     };
-    match detokenizer.detokenize(&text) {
-        Ok(detokenized) => {
-            let val: Value =
-                serde_json::from_str(&detokenized).unwrap_or(Value::String(detokenized));
-            Json(val).into_response()
+    if let Ok(mut val) = serde_json::from_str::<Value>(&text) {
+        if let Err(resp) = detokenize_json_strings(&mut val, detokenizer) {
+            return resp;
         }
-        Err(e) => {
-            error!(error = %e, "detokenization failed");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "detokenization error")
+        Json(val).into_response()
+    } else {
+        match detokenizer.detokenize(&text) {
+            Ok(detokenized) => Json(Value::String(detokenized)).into_response(),
+            Err(e) => {
+                error!(error = %e, "detokenization failed");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "detokenization error")
+            }
         }
     }
 }
@@ -250,7 +325,10 @@ async fn handle_streaming(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, String>>(32);
 
     tokio::spawn(async move {
-        let mut sd = state.detokenizer.streaming();
+        let mut stream_detokenizers: HashMap<
+            Vec<JsonPathSegment>,
+            crate::detokenizer::StreamingDetokenizer,
+        > = HashMap::new();
         let mut byte_stream = upstream_resp.bytes_stream();
         let mut line_buf = String::new();
 
@@ -282,16 +360,7 @@ async fn handle_streaming(
                 };
 
                 if data == "[DONE]" {
-                    // Flush any content held in the sliding window.
-                    match sd.flush() {
-                        Ok(remaining) if !remaining.is_empty() => {
-                            let _ = tx.send(Ok(make_delta_event(&remaining))).await;
-                        }
-                        Err(e) => {
-                            warn!(request_id = %request_id, error = %e, "detokenizer flush error")
-                        }
-                        _ => {}
-                    }
+                    flush_stream_json_strings(&tx, &mut stream_detokenizers, request_id).await;
                     let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
                     return;
                 }
@@ -301,25 +370,18 @@ async fn handle_streaming(
                     Err(_) => continue,
                 };
 
-                if let Some(content) = extract_delta_content(&json_val).map(str::to_string) {
-                    match sd.push_chunk(&content) {
-                        Ok(safe) if !safe.is_empty() => {
-                            // Replace the content in the original JSON with the safe portion
-                            // so metadata fields (id, model, finish_reason) are preserved.
-                            set_delta_content(&mut json_val, &safe);
-                            let _ = tx
-                                .send(Ok(Event::default().data(json_val.to_string())))
-                                .await;
-                        }
-                        Ok(_) => {
-                            // Content is still being buffered — do not forward this chunk yet.
-                        }
-                        Err(e) => {
-                            warn!(request_id = %request_id, error = %e, "streaming detokenizer error");
-                        }
-                    }
-                } else {
-                    // No content field (role delta, finish_reason, tool calls, etc.) — forward unchanged.
+                let had_buffered_strings = detokenize_streaming_json_strings(
+                    &mut json_val,
+                    &mut stream_detokenizers,
+                    &state.detokenizer,
+                    request_id,
+                );
+
+                if has_finish_reason(&json_val) {
+                    flush_stream_json_strings(&tx, &mut stream_detokenizers, request_id).await;
+                }
+
+                if should_forward_stream_event(&json_val, had_buffered_strings) {
                     let _ = tx
                         .send(Ok(Event::default().data(json_val.to_string())))
                         .await;
@@ -328,15 +390,7 @@ async fn handle_streaming(
         }
 
         // Upstream closed the stream without [DONE].
-        match sd.flush() {
-            Ok(remaining) if !remaining.is_empty() => {
-                let _ = tx.send(Ok(make_delta_event(&remaining))).await;
-            }
-            Err(e) => {
-                warn!(request_id = %request_id, error = %e, "detokenizer flush on stream close")
-            }
-            _ => {}
-        }
+        flush_stream_json_strings(&tx, &mut stream_detokenizers, request_id).await;
     });
 
     Sse::new(ReceiverStream::new(rx))
@@ -346,32 +400,247 @@ async fn handle_streaming(
 
 // ── SSE helpers ───────────────────────────────────────────────────────────────
 
-fn extract_delta_content(val: &Value) -> Option<&str> {
-    val.get("choices")?
-        .get(0)?
-        .get("delta")?
-        .get("content")?
-        .as_str()
+fn has_finish_reason(val: &Value) -> bool {
+    val.get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("finish_reason"))
+        .is_some_and(|finish| !finish.is_null())
 }
 
-fn set_delta_content(val: &mut Value, content: &str) {
-    if let Some(choices) = val.get_mut("choices") {
-        if let Some(choice) = choices.get_mut(0) {
-            if let Some(delta) = choice.get_mut("delta") {
-                delta["content"] = Value::String(content.to_string());
+fn delta_has_fields(val: &Value) -> bool {
+    val.get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("delta"))
+        .and_then(Value::as_object)
+        .is_some_and(|delta| !delta.is_empty())
+}
+
+fn should_forward_stream_event(val: &Value, had_buffered_field: bool) -> bool {
+    if !had_buffered_field {
+        return true;
+    }
+    has_finish_reason(val) || delta_has_fields(val)
+}
+
+fn is_stream_buffered_path(path: &[JsonPathSegment]) -> bool {
+    path.iter().any(|segment| {
+        matches!(
+            segment,
+            JsonPathSegment::Key(key)
+                if key == "delta"
+                    || key == "message"
+                    || key == "text"
+                    || key == "content"
+                    || key == "reasoning_content"
+                    || key == "arguments"
+        )
+    }) && !matches!(
+        path.last(),
+        Some(JsonPathSegment::Key(key)) if is_protocol_key(key)
+    )
+}
+
+fn detokenize_streaming_json_strings(
+    value: &mut Value,
+    streams: &mut HashMap<Vec<JsonPathSegment>, crate::detokenizer::StreamingDetokenizer>,
+    detokenizer: &Detokenizer,
+    request_id: Uuid,
+) -> bool {
+    let mut paths = Vec::new();
+    collect_all_string_paths(value, &mut Vec::new(), &mut paths);
+    let mut saw_buffered = false;
+
+    for path in paths {
+        let Some(text_val) = value_mut_at_path(value, &path) else {
+            continue;
+        };
+        let Some(text) = text_val.as_str().map(str::to_string) else {
+            continue;
+        };
+
+        if !is_stream_buffered_path(&path) {
+            match detokenizer.detokenize(&text) {
+                Ok(detokenized) => *text_val = Value::String(detokenized),
+                Err(e) => {
+                    warn!(request_id = %request_id, error = %e, "streaming metadata detokenizer error");
+                }
             }
+            continue;
+        }
+
+        saw_buffered = true;
+        let stream = streams
+            .entry(path.clone())
+            .or_insert_with(|| detokenizer.streaming());
+        match stream.push_chunk(&text) {
+            Ok(safe) if !safe.is_empty() => {
+                *text_val = Value::String(safe);
+            }
+            Ok(_) => {
+                remove_value_at_path(value, &path);
+            }
+            Err(e) => {
+                warn!(request_id = %request_id, path = ?path, error = %e, "streaming detokenizer error");
+                remove_value_at_path(value, &path);
+            }
+        }
+    }
+    prune_empty_streaming_containers(value);
+    saw_buffered
+}
+
+fn collect_all_string_paths(
+    value: &Value,
+    path: &mut Vec<JsonPathSegment>,
+    out: &mut Vec<Vec<JsonPathSegment>>,
+) {
+    match value {
+        Value::String(_) => out.push(path.clone()),
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                path.push(JsonPathSegment::Index(index));
+                collect_all_string_paths(item, path, out);
+                path.pop();
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                path.push(JsonPathSegment::Key(key.clone()));
+                collect_all_string_paths(item, path, out);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn remove_value_at_path(value: &mut Value, path: &[JsonPathSegment]) {
+    let Some((last, parent_path)) = path.split_last() else {
+        return;
+    };
+    let Some(parent) = value_mut_at_path(value, parent_path) else {
+        return;
+    };
+    match (parent, last) {
+        (Value::Object(map), JsonPathSegment::Key(key)) => {
+            map.remove(key);
+        }
+        (Value::Array(items), JsonPathSegment::Index(index)) => {
+            if let Some(item) = items.get_mut(*index) {
+                *item = Value::Null;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn prune_empty_streaming_containers(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                prune_empty_streaming_containers(item);
+            }
+            items.retain(|item| !item.is_null() && !is_empty_streaming_container(item));
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                prune_empty_streaming_containers(item);
+            }
+            map.retain(|_, item| !is_empty_streaming_container(item));
+        }
+        _ => {}
+    }
+}
+
+fn is_empty_streaming_container(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.is_empty() || (map.len() == 1 && map.contains_key("index")),
+        Value::Array(items) => items.is_empty(),
+        _ => false,
+    }
+}
+
+async fn flush_stream_json_strings(
+    tx: &tokio::sync::mpsc::Sender<Result<Event, String>>,
+    streams: &mut HashMap<Vec<JsonPathSegment>, crate::detokenizer::StreamingDetokenizer>,
+    request_id: Uuid,
+) {
+    let mut entries: Vec<_> = streams.drain().collect();
+    entries.sort_by_key(|(path, _)| path.len());
+    for (path, mut sd) in entries {
+        match sd.flush() {
+            Ok(remaining) if !remaining.is_empty() => {
+                let _ = tx
+                    .send(Ok(make_stream_delta_event(&path, &remaining)))
+                    .await;
+            }
+            Err(e) => {
+                warn!(
+                    request_id = %request_id,
+                    path = ?path,
+                    error = %e,
+                    "streaming detokenizer flush error"
+                )
+            }
+            _ => {}
         }
     }
 }
 
-/// Creates a minimal SSE delta event carrying only the given content string.
-/// Used when the detokenizer releases safe content that doesn't map 1:1 to
-/// an upstream chunk.
-fn make_delta_event(content: &str) -> Event {
-    let chunk = json!({
-        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": null}]
-    });
+fn make_stream_delta_event(path: &[JsonPathSegment], content: &str) -> Event {
+    let mut chunk = json!({"choices": [{"index": 0, "delta": {}, "finish_reason": null}]});
+    if let Some(delta_pos) = path
+        .iter()
+        .position(|segment| matches!(segment, JsonPathSegment::Key(key) if key == "delta"))
+    {
+        let relative = &path[delta_pos + 1..];
+        set_value_at_path(
+            &mut chunk["choices"][0]["delta"],
+            relative,
+            Value::String(content.to_string()),
+        );
+    }
     Event::default().data(chunk.to_string())
+}
+
+fn set_value_at_path(value: &mut Value, path: &[JsonPathSegment], replacement: Value) {
+    if path.is_empty() {
+        *value = replacement;
+        return;
+    }
+    let mut current = value;
+    for (index, segment) in path.iter().enumerate() {
+        let is_last = index == path.len() - 1;
+        match segment {
+            JsonPathSegment::Key(key) => {
+                if is_last {
+                    current[key] = replacement;
+                    return;
+                }
+                if !current.get(key).is_some() {
+                    current[key] = match path.get(index + 1) {
+                        Some(JsonPathSegment::Index(_)) => Value::Array(vec![]),
+                        _ => Value::Object(serde_json::Map::new()),
+                    };
+                }
+                current = &mut current[key];
+            }
+            JsonPathSegment::Index(item_index) => {
+                if !current.is_array() {
+                    *current = Value::Array(vec![]);
+                }
+                let items = current.as_array_mut().expect("current must be array");
+                while items.len() <= *item_index {
+                    items.push(Value::Object(serde_json::Map::new()));
+                }
+                if is_last {
+                    items[*item_index] = replacement;
+                    return;
+                }
+                current = &mut items[*item_index];
+            }
+        }
+    }
 }
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
@@ -396,4 +665,246 @@ fn upstream_error_response(e: &UpstreamError) -> Response {
         _ => StatusCode::BAD_GATEWAY,
     };
     error_response(status, "upstream unavailable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        detector::{regex::RegexDetector, DetectorPipeline},
+        tokenizer::Tokenizer,
+        types::{EntityType, Token, TokenRecord},
+        vault::{sqlite::SqliteVault, Vault},
+    };
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unix_now() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    fn make_detokenizer() -> Detokenizer {
+        let vault: Arc<dyn Vault> = Arc::new(SqliteVault::open_in_memory(b"test-secret").unwrap());
+        let now = unix_now();
+        vault
+            .store(&TokenRecord {
+                token: Token::new("EMAIL_a1b2c3"),
+                entity_type: EntityType::Email,
+                encrypted_value: b"alice@example.test".to_vec(),
+                session_id: Uuid::new_v4(),
+                created_at: now,
+                expires_at: now + 3600,
+            })
+            .unwrap();
+        Detokenizer::new(vault)
+    }
+
+    fn make_tokenization_stack() -> (DetectorPipeline, Tokenizer, Detokenizer) {
+        let secret = b"test-secret".to_vec();
+        let vault: Arc<dyn Vault> = Arc::new(SqliteVault::open_in_memory(&secret).unwrap());
+        let pipeline = DetectorPipeline::new(vec![Box::new(RegexDetector::new())]);
+        let tokenizer = Tokenizer::new(Arc::clone(&vault), secret, Uuid::new_v4(), 24);
+        let detokenizer = Detokenizer::new(vault);
+        (pipeline, tokenizer, detokenizer)
+    }
+
+    #[test]
+    fn detokenizes_streaming_tool_call_arguments() {
+        let detokenizer = make_detokenizer();
+        let mut streams = HashMap::new();
+        let mut chunk = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {
+                            "arguments": format!(
+                                "{{\"content\":\"EMAIL_a1b2c3\"}}{}",
+                                "x".repeat(600)
+                            )
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        });
+
+        assert!(detokenize_streaming_json_strings(
+            &mut chunk,
+            &mut streams,
+            &detokenizer,
+            Uuid::new_v4(),
+        ));
+
+        let arguments = chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments should contain the safe streamed prefix");
+        assert!(
+            arguments.contains("alice@example.test"),
+            "streamed tool arguments should be detokenized before forwarding"
+        );
+        assert!(
+            !arguments.contains("EMAIL_a1b2c3"),
+            "streamed tool arguments should not leak raw Privox tokens"
+        );
+    }
+
+    #[test]
+    fn buffers_short_streaming_tool_call_arguments() {
+        let detokenizer = make_detokenizer();
+        let mut streams = HashMap::new();
+        let mut chunk = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {
+                            "arguments": "{\"content\":\"EMAIL_"
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        });
+
+        assert!(detokenize_streaming_json_strings(
+            &mut chunk,
+            &mut streams,
+            &detokenizer,
+            Uuid::new_v4(),
+        ));
+
+        assert!(
+            chunk["choices"][0].get("delta").is_none()
+                || chunk["choices"][0]["delta"].as_object().unwrap().is_empty(),
+            "buffered tool arguments should be withheld until they can be safely detokenized"
+        );
+    }
+
+    #[test]
+    fn detokenizes_streaming_content_recursively() {
+        let detokenizer = make_detokenizer();
+        let mut streams = HashMap::new();
+        let mut chunk = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": format!("{} EMAIL_a1b2c3 {}", "x".repeat(40), "y".repeat(600))
+                },
+                "finish_reason": null
+            }]
+        });
+
+        assert!(detokenize_streaming_json_strings(
+            &mut chunk,
+            &mut streams,
+            &detokenizer,
+            Uuid::new_v4(),
+        ));
+
+        let content = chunk["choices"][0]["delta"]["content"]
+            .as_str()
+            .expect("content should contain the safe streamed prefix");
+        assert!(content.contains("alice@example.test"));
+        assert!(!content.contains("EMAIL_a1b2c3"));
+    }
+
+    #[tokio::test]
+    async fn tokenizes_outbound_json_string_leaves_without_rewriting_protocol_fields() {
+        let (pipeline, tokenizer, detokenizer) = make_tokenization_stack();
+        let mut body = json!({
+            "model": "qwen/qwen3.6-27b",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Please process alice@example.test"
+                },
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "workspace_write",
+                            "arguments": "{\"content\":\"alice@example.test\"}"
+                        }
+                    }]
+                }
+            ]
+        });
+
+        let found = tokenize_json_strings(&mut body, &pipeline, &tokenizer, Uuid::new_v4())
+            .await
+            .expect("JSON string leaves should tokenize");
+
+        let content = body["messages"][0]["content"]
+            .as_str()
+            .expect("content should remain a string");
+        let arguments = body["messages"][1]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments should remain a string");
+        assert_eq!(found, vec![EntityType::Email, EntityType::Email]);
+        assert!(
+            !content.contains("alice@example.test") && !arguments.contains("alice@example.test"),
+            "outbound context must not expose restored values upstream"
+        );
+        assert!(
+            content.contains("EMAIL_") && arguments.contains("EMAIL_"),
+            "outbound context should use Privox tokens"
+        );
+        assert_eq!(body["model"].as_str().unwrap(), "qwen/qwen3.6-27b");
+        assert_eq!(body["messages"][0]["role"].as_str().unwrap(), "user");
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["function"]["name"]
+                .as_str()
+                .unwrap(),
+            "workspace_write"
+        );
+        assert!(
+            !arguments.contains("alice@example.test"),
+            "outbound tool-call history must not expose restored values upstream"
+        );
+        assert!(
+            arguments.contains("EMAIL_"),
+            "outbound tool-call history should use Privox tokens"
+        );
+        assert_eq!(
+            detokenizer.detokenize(arguments).unwrap(),
+            "{\"content\":\"alice@example.test\"}"
+        );
+    }
+
+    #[test]
+    fn detokenizes_inbound_json_string_leaves() {
+        let detokenizer = make_detokenizer();
+        let mut body = json!({
+            "choices": [{
+                "message": {
+                    "content": "Contact EMAIL_a1b2c3",
+                    "tool_calls": [{
+                        "function": {
+                            "arguments": "{\"email\":\"EMAIL_a1b2c3\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+
+        detokenize_json_strings(&mut body, &detokenizer).expect("JSON should detokenize");
+
+        assert_eq!(
+            body["choices"][0]["message"]["content"].as_str().unwrap(),
+            "Contact alice@example.test"
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+            "{\"email\":\"alice@example.test\"}"
+        );
+    }
 }
