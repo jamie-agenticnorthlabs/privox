@@ -37,10 +37,20 @@ impl UpstreamClient {
     ///
     /// Returns [`UpstreamError::Connect`] when the upstream is unreachable,
     /// [`UpstreamError::Http`] for other reqwest errors.
-    pub async fn post(&self, path: &str, body: &Value) -> Result<Response, UpstreamError> {
-        let url = format!("{}{}", self.base_url, path);
+    pub async fn post(
+        &self,
+        path: &str,
+        body: &Value,
+        upstream_base_url: Option<&str>,
+        headers: &[(String, String)],
+    ) -> Result<Response, UpstreamError> {
+        let url = self.upstream_url(path, upstream_base_url);
         debug!(url = %url, "forwarding request to upstream");
-        self.client.post(&url).json(body).send().await.map_err(|e| {
+        let mut request = self.client.post(&url).json(body);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        request.send().await.map_err(|e| {
             if e.is_connect() || e.is_timeout() {
                 UpstreamError::Connect {
                     url: url.clone(),
@@ -50,5 +60,48 @@ impl UpstreamClient {
                 UpstreamError::Http(e)
             }
         })
+    }
+
+    fn upstream_url(&self, path: &str, upstream_base_url: Option<&str>) -> String {
+        let base = upstream_base_url
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or(&self.base_url)
+            .trim_end_matches('/');
+        if upstream_base_url.is_some() && base.ends_with("/v1") && path.starts_with("/v1/") {
+            return format!("{}{}", base, &path[3..]);
+        }
+        format!("{}{}", base, path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::UpstreamConfig;
+
+    fn client() -> UpstreamClient {
+        UpstreamClient::new(&UpstreamConfig {
+            url: "http://local-model:1234".to_string(),
+            timeout_secs: 30,
+        })
+    }
+
+    #[test]
+    fn dynamic_v1_upstream_does_not_duplicate_v1_path() {
+        assert_eq!(
+            client().upstream_url(
+                "/v1/chat/completions",
+                Some("https://api.cohere.ai/compatibility/v1"),
+            ),
+            "https://api.cohere.ai/compatibility/v1/chat/completions",
+        );
+    }
+
+    #[test]
+    fn configured_upstream_keeps_existing_v1_path() {
+        assert_eq!(
+            client().upstream_url("/v1/chat/completions", None),
+            "http://local-model:1234/v1/chat/completions",
+        );
     }
 }

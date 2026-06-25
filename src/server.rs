@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
     routing::post,
@@ -56,10 +56,16 @@ pub async fn run(state: Arc<AppState>, listen: &str) -> anyhow::Result<()> {
 
 async fn chat_completions_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<ChatRequest>,
 ) -> Response {
     let request_id = Uuid::new_v4();
     let streaming = request.stream;
+    let upstream_base_url = match upstream_base_url_from_headers(&headers) {
+        Ok(url) => url,
+        Err(resp) => return resp,
+    };
+    let upstream_headers = upstream_headers_from_headers(&headers);
 
     // Stage 2a: Detect and tokenize all eligible string leaves in the full
     // request payload. Protocol/control fields are skipped so model IDs, roles,
@@ -85,7 +91,16 @@ async fn chat_completions_handler(
     );
 
     // Stage 3: Forward sanitized request to upstream.
-    let upstream_resp = match state.upstream.post("/v1/chat/completions", &body).await {
+    let upstream_resp = match state
+        .upstream
+        .post(
+            "/v1/chat/completions",
+            &body,
+            upstream_base_url.as_deref(),
+            &upstream_headers,
+        )
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             error!(request_id = %request_id, error = %e, "upstream unreachable");
@@ -121,9 +136,15 @@ async fn chat_completions_handler(
 /// Legacy `/v1/completions` handler — applies the same pipeline to the `prompt` field.
 async fn legacy_completions_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> Response {
     let request_id = Uuid::new_v4();
+    let upstream_base_url = match upstream_base_url_from_headers(&headers) {
+        Ok(url) => url,
+        Err(resp) => return resp,
+    };
+    let upstream_headers = upstream_headers_from_headers(&headers);
 
     if let Err(resp) =
         tokenize_json_strings(&mut body, &state.pipeline, &state.tokenizer, request_id).await
@@ -131,7 +152,16 @@ async fn legacy_completions_handler(
         return resp;
     }
 
-    let upstream_resp = match state.upstream.post("/v1/completions", &body).await {
+    let upstream_resp = match state
+        .upstream
+        .post(
+            "/v1/completions",
+            &body,
+            upstream_base_url.as_deref(),
+            &upstream_headers,
+        )
+        .await
+    {
         Ok(r) => r,
         Err(e) => return upstream_error_response(&e),
     };
@@ -155,6 +185,48 @@ async fn legacy_completions_handler(
 enum JsonPathSegment {
     Key(String),
     Index(usize),
+}
+
+fn upstream_base_url_from_headers(headers: &HeaderMap) -> Result<Option<String>, Response> {
+    let Some(value) = headers.get("x-privox-upstream-base-url") else {
+        return Ok(None);
+    };
+    let Ok(url) = value.to_str() else {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid upstream base URL header",
+        ));
+    };
+    let url = url.trim().trim_end_matches('/').to_string();
+    if url.is_empty() {
+        return Ok(None);
+    }
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "upstream base URL must use http or https",
+        ));
+    }
+    Ok(Some(url))
+}
+
+fn upstream_headers_from_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    const FORWARDED_HEADERS: &[&str] = &[
+        "authorization",
+        "http-referer",
+        "x-client-name",
+        "x-openrouter-title",
+    ];
+
+    FORWARDED_HEADERS
+        .iter()
+        .filter_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| ((*name).to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 fn is_protocol_key(key: &str) -> bool {
@@ -708,6 +780,53 @@ mod tests {
         let tokenizer = Tokenizer::new(Arc::clone(&vault), secret, Uuid::new_v4(), 24);
         let detokenizer = Detokenizer::new(vault);
         (pipeline, tokenizer, detokenizer)
+    }
+
+    #[test]
+    fn extracts_dynamic_upstream_base_url_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-privox-upstream-base-url",
+            "https://api.cohere.ai/compatibility/v1".parse().unwrap(),
+        );
+
+        assert_eq!(
+            upstream_base_url_from_headers(&headers).unwrap(),
+            Some("https://api.cohere.ai/compatibility/v1".to_string()),
+        );
+    }
+
+    #[test]
+    fn rejects_non_http_dynamic_upstream_base_url_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-privox-upstream-base-url",
+            "file:///etc/passwd".parse().unwrap(),
+        );
+
+        assert!(upstream_base_url_from_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn forwards_provider_headers_without_privox_control_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer provider-key".parse().unwrap());
+        headers.insert("x-client-name", "CanadaAgents".parse().unwrap());
+        headers.insert(
+            "x-privox-upstream-base-url",
+            "https://api.cohere.ai/compatibility/v1".parse().unwrap(),
+        );
+
+        let forwarded = upstream_headers_from_headers(&headers);
+
+        assert!(forwarded.contains(&(
+            "authorization".to_string(),
+            "Bearer provider-key".to_string(),
+        )));
+        assert!(forwarded.contains(&("x-client-name".to_string(), "CanadaAgents".to_string())));
+        assert!(!forwarded
+            .iter()
+            .any(|(name, _)| name == "x-privox-upstream-base-url"));
     }
 
     #[test]
